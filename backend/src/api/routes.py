@@ -115,7 +115,8 @@ async def recognize_file(
     undistort_preset: Optional[str] = Query(
         None, 
         description="畸变矫正预设：none/standard/wide_angle/fisheye（针对广角摄像头）"
-    )
+    ),
+    draw_box: bool = Query(False, description="是否在原图上绘制车牌边界框，返回base64格式图片")
 ):
     """
     上传图像文件进行车牌识别
@@ -148,7 +149,7 @@ async def recognize_file(
             )
         
         # 执行识别
-        result = await _process_image(image, image_id, preprocess, undistort_preset)
+        result = await _process_image(image, image_id, preprocess, undistort_preset, draw_box)
         
         # 计算处理时间
         processing_time = (time.time() - start_time) * 1000
@@ -167,7 +168,10 @@ async def recognize_file(
 
 
 @router.post("/recognize/base64", response_model=RecognitionResponse, tags=["识别"])
-async def recognize_base64(request: ImageRecognitionRequest):
+async def recognize_base64(
+    request: ImageRecognitionRequest,
+    draw_box: bool = Query(False, description="是否在原图上绘制车牌边界框，返回base64格式图片")
+):
     """
     Base64编码图像识别
     
@@ -190,7 +194,7 @@ async def recognize_base64(request: ImageRecognitionRequest):
             )
         
         # 执行识别
-        result = await _process_image(image, image_id, preprocess=True)
+        result = await _process_image(image, image_id, preprocess=True, draw_box=draw_box)
         
         # 计算处理时间
         processing_time = (time.time() - start_time) * 1000
@@ -209,7 +213,10 @@ async def recognize_base64(request: ImageRecognitionRequest):
 
 
 @router.post("/recognize/url", response_model=RecognitionResponse, tags=["识别"])
-async def recognize_url(request: UrlRecognitionRequest):
+async def recognize_url(
+    request: UrlRecognitionRequest,
+    draw_box: bool = Query(False, description="是否在原图上绘制车牌边界框，返回base64格式图片")
+):
     """
     URL图像识别
     
@@ -238,7 +245,7 @@ async def recognize_url(request: UrlRecognitionRequest):
             )
         
         # 执行识别
-        result = await _process_image(image, image_id, preprocess=True)
+        result = await _process_image(image, image_id, preprocess=True, draw_box=draw_box)
         
         # 计算处理时间
         processing_time = (time.time() - start_time) * 1000
@@ -291,7 +298,8 @@ async def _process_image(
     image: np.ndarray,
     image_id: str,
     preprocess: bool = True,
-    undistort_preset: Optional[str] = None
+    undistort_preset: Optional[str] = None,
+    draw_box: bool = False
 ) -> RecognitionResponse:
     """
     处理单张图像（优化版）
@@ -306,11 +314,16 @@ async def _process_image(
         image_id: 图像ID
         preprocess: 是否预处理
         undistort_preset: 畸变矫正预设（针对广角摄像头）
+        draw_box: 是否在原图上绘制车牌边界框
         
     Returns:
         识别响应
     """
     detector = get_detector()
+    # 保存原始图像用于绘制边界框
+    original_image = image.copy() if draw_box else None
+    # 记录缩放比例，用于坐标还原
+    scale = 1.0
     
     # 根据畸变矫正参数创建预处理器
     if undistort_preset and undistort_preset != "none":
@@ -321,6 +334,11 @@ async def _process_image(
     
     # 预处理（已优化为快速模式）
     if preprocess:
+        # 先计算缩放比例
+        h, w = image.shape[:2]
+        max_dim = max(h, w)
+        if max_dim > preprocessor.max_input_size:
+            scale = preprocessor.max_input_size / max_dim
         image = preprocessor.process(image)
     
     # 检测车牌（HyperLPR3 同时返回检测和识别结果）
@@ -367,6 +385,45 @@ async def _process_image(
         "plate_count": len(plates),
         "plates": plates
     }
+    
+    # 如果需要绘制边界框并返回base64
+    if draw_box and original_image is not None:
+        # 使用原始图像绘制边界框，避免预处理后的图像差异
+        image_with_boxes = original_image
+        for det in detections:
+            x1, y1, x2, y2 = det.bbox
+            # 还原坐标到原始图像尺寸（除以缩放比例）
+            if scale != 1.0:
+                x1 = int(x1 / scale)
+                y1 = int(y1 / scale)
+                x2 = int(x2 / scale)
+                y2 = int(y2 / scale)
+            # 绘制边界框（蓝色，粗细2）
+            cv2.rectangle(image_with_boxes, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            # 绘制车牌文本（白色，背景蓝色）
+            if det.plate_text:
+                text = det.plate_text
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.6
+                thickness = 2
+                text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+                text_x = x1
+                # 确保文本不会超出图像顶部边界
+                text_y = y1 - 10 if (y1 - 10 - text_size[1]) > 0 else y1 + text_size[1] + 10
+                # 绘制文本背景
+                cv2.rectangle(image_with_boxes, 
+                            (text_x, text_y - text_size[1] - 5), 
+                            (text_x + text_size[0], text_y + 5), 
+                            (255, 0, 0), -1)
+                # 绘制文本
+                cv2.putText(image_with_boxes, text, (text_x, text_y), 
+                          font, font_scale, (255, 255, 255), thickness)
+        
+        # 编码为JPG格式
+        _, buffer = cv2.imencode('.jpg', image_with_boxes)
+        # 转换为base64
+        image_base64 = base64.b64encode(buffer).decode('utf-8')
+        result_data["image_with_boxes"] = f"data:image/jpeg;base64,{image_base64}"
     
     # 保存识别结果到本地文件 (JSON/XML)
     try:
