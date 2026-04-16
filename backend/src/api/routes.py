@@ -8,6 +8,7 @@ import time
 import uuid
 import tempfile
 import asyncio
+import dataclasses
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from pathlib import Path
 
@@ -115,7 +116,8 @@ async def recognize_file(
     undistort_preset: Optional[str] = Query(
         None, 
         description="畸变矫正预设：none/standard/wide_angle/fisheye（针对广角摄像头）"
-    )
+    ),
+    draw_box: bool = Query(False, description="是否在原图上绘制检测框并返回 base64")
 ):
     """
     上传图像文件进行车牌识别
@@ -147,8 +149,12 @@ async def recognize_file(
                 data={"image_id": image_id}
             )
         
+        # 保存原始图像和尺寸
+        original_image = image.copy()
+        original_h, original_w = image.shape[:2]
+        
         # 执行识别
-        result = await _process_image(image, image_id, preprocess, undistort_preset)
+        result = await _process_image(image, image_id, preprocess, undistort_preset, draw_box, original_image, original_w, original_h)
         
         # 计算处理时间
         processing_time = (time.time() - start_time) * 1000
@@ -291,7 +297,11 @@ async def _process_image(
     image: np.ndarray,
     image_id: str,
     preprocess: bool = True,
-    undistort_preset: Optional[str] = None
+    undistort_preset: Optional[str] = None,
+    draw_box: bool = False,
+    original_image: Optional[np.ndarray] = None,
+    original_w: int = 0,
+    original_h: int = 0
 ) -> RecognitionResponse:
     """
     处理单张图像（优化版）
@@ -367,6 +377,48 @@ async def _process_image(
         "plate_count": len(plates),
         "plates": plates
     }
+    
+    # 如果需要绘制检测框，添加带框图像的 base64
+    if draw_box and detections:
+        if original_image is not None and original_w > 0 and original_h > 0:
+            # 计算缩放比例，将检测框坐标转换回原图坐标
+            processed_h, processed_w = image.shape[:2]
+            
+            # 图像预处理使用等比例缩放，缩放比例基于最大边长
+            max_original_dim = max(original_h, original_w)
+            max_processed_dim = max(processed_h, processed_w)
+            
+            # 使用统一的缩放比例（保持宽高比）
+            scale = max_original_dim / max_processed_dim
+            
+            logger.debug(f"坐标转换: 原图 {original_w}x{original_h} -> 预处理后 {processed_w}x{processed_h}, 缩放比例: {scale}")
+            
+            # 转换检测框坐标
+            detections_for_draw = []
+            for det in detections:
+                bbox = det.bbox
+                logger.debug(f"  预处理后坐标: ({bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]})")
+                
+                # 转换坐标到原图
+                new_bbox = (
+                    int(bbox[0] * scale),
+                    int(bbox[1] * scale),
+                    int(bbox[2] * scale),
+                    int(bbox[3] * scale)
+                )
+                logger.debug(f"  转换后坐标: {new_bbox}")
+                
+                # 使用 dataclasses.replace 创建新对象
+                det_copy = dataclasses.replace(det, bbox=new_bbox)
+                detections_for_draw.append(det_copy)
+            
+            # 在原图上绘制框
+            image_with_boxes = _draw_plate_boxes(original_image, detections_for_draw)
+        else:
+            # 没有原始图像信息，在预处理后的图像上绘制
+            image_with_boxes = _draw_plate_boxes(image, detections)
+        
+        result_data["image_with_boxes"] = _encode_image_base64(image_with_boxes)
     
     # 保存识别结果到本地文件 (JSON/XML)
     try:
@@ -508,6 +560,56 @@ def _encode_image_base64(image: np.ndarray) -> Optional[str]:
     except Exception as e:
         logger.warning(f"图像编码失败: {e}")
         return None
+
+
+def _draw_plate_boxes(image: np.ndarray, detections: list) -> np.ndarray:
+    """
+    在图像上绘制车牌检测框
+    
+    Args:
+        image: 原始图像
+        detections: 检测结果列表
+        
+    Returns:
+        绘制了检测框的图像
+    """
+    try:
+        img_copy = image.copy()
+        
+        for det in detections:
+            bbox = det.bbox
+            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+            
+            # 绘制矩形框（绿色，粗细为2）
+            cv2.rectangle(img_copy, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # 绘制车牌文本
+            plate_text = det.plate_text or ""
+            if plate_text:
+                # 在框上方绘制文本背景
+                text_size = cv2.getTextSize(plate_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                cv2.rectangle(
+                    img_copy, 
+                    (x1, y1 - text_size[1] - 10), 
+                    (x1 + text_size[0], y1), 
+                    (0, 255, 0), 
+                    -1
+                )
+                # 绘制文本（白色）
+                cv2.putText(
+                    img_copy, 
+                    plate_text, 
+                    (x1, y1 - 5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.6, 
+                    (255, 255, 255), 
+                    2
+                )
+        
+        return img_copy
+    except Exception as e:
+        logger.warning(f"绘制检测框失败: {e}")
+        return image
 
 
 @router.get("/stats", tags=["系统"])
