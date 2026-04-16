@@ -115,7 +115,8 @@ async def recognize_file(
     undistort_preset: Optional[str] = Query(
         None, 
         description="畸变矫正预设：none/standard/wide_angle/fisheye（针对广角摄像头）"
-    )
+    ),
+    draw_box: bool = Query(False, description="是否在原图上绘制检测框并以Base64返回")
 ):
     """
     上传图像文件进行车牌识别
@@ -148,7 +149,7 @@ async def recognize_file(
             )
         
         # 执行识别
-        result = await _process_image(image, image_id, preprocess, undistort_preset)
+        result = await _process_image(image, image_id, preprocess, undistort_preset, draw_box)
         
         # 计算处理时间
         processing_time = (time.time() - start_time) * 1000
@@ -190,7 +191,7 @@ async def recognize_base64(request: ImageRecognitionRequest):
             )
         
         # 执行识别
-        result = await _process_image(image, image_id, preprocess=True)
+        result = await _process_image(image, image_id, preprocess=True, draw_box=request.draw_box)
         
         # 计算处理时间
         processing_time = (time.time() - start_time) * 1000
@@ -238,7 +239,7 @@ async def recognize_url(request: UrlRecognitionRequest):
             )
         
         # 执行识别
-        result = await _process_image(image, image_id, preprocess=True)
+        result = await _process_image(image, image_id, preprocess=True, draw_box=request.draw_box)
         
         # 计算处理时间
         processing_time = (time.time() - start_time) * 1000
@@ -291,7 +292,8 @@ async def _process_image(
     image: np.ndarray,
     image_id: str,
     preprocess: bool = True,
-    undistort_preset: Optional[str] = None
+    undistort_preset: Optional[str] = None,
+    draw_box: bool = False
 ) -> RecognitionResponse:
     """
     处理单张图像（优化版）
@@ -312,6 +314,10 @@ async def _process_image(
     """
     detector = get_detector()
     
+    # 保存原始图像副本和尺寸（用于画框）
+    original_image = image.copy() if draw_box else None
+    original_h, original_w = image.shape[:2] if draw_box else (None, None)
+    
     # 根据畸变矫正参数创建预处理器
     if undistort_preset and undistort_preset != "none":
         from ..preprocessor import ImageProcessor
@@ -323,18 +329,30 @@ async def _process_image(
     if preprocess:
         image = preprocessor.process(image)
     
+    # 计算缩放比例（如果图像被预处理改变了尺寸）
+    scale_w = 1.0
+    scale_h = 1.0
+    if draw_box and preprocess:
+        processed_h, processed_w = image.shape[:2]
+        scale_w = original_w / processed_w
+        scale_h = original_h / processed_h
+    
     # 检测车牌（HyperLPR3 同时返回检测和识别结果）
     detections = detector.detect(image)
     
     if not detections:
+        result_data = {
+            "image_id": image_id,
+            "plate_count": 0,
+            "plates": []
+        }
+        # 如果需要画框但没有检测到车牌，也返回原始图像
+        if draw_box:
+            result_data["image_with_boxes"] = _encode_image_base64(original_image)
         return RecognitionResponse(
             code=ResponseCode.NO_PLATE_DETECTED,
             message=RESPONSE_MESSAGES[ResponseCode.NO_PLATE_DETECTED],
-            data={
-                "image_id": image_id,
-                "plate_count": 0,
-                "plates": []
-            }
+            data=result_data
         )
     
     # 处理每个车牌
@@ -361,12 +379,56 @@ async def _process_image(
         
         plates.append(plate_result)
     
+    # 在原图上绘制检测框
+    if draw_box and original_image is not None:
+        for det, plate in zip(detections, plates):
+            bbox = plate["bbox"]
+            # 转换坐标到原始图像空间（如果图像被缩放过）
+            x1 = int(bbox["x1"] * scale_w)
+            y1 = int(bbox["y1"] * scale_h)
+            x2 = int(bbox["x2"] * scale_w)
+            y2 = int(bbox["y2"] * scale_h)
+            # 绘制矩形框
+            cv2.rectangle(
+                original_image,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),  # 绿色
+                2
+            )
+            # 绘制车牌号码
+            plate_number = plate["plate_number"]
+            confidence = plate["confidence"]
+            label = f"{plate_number} ({confidence:.2f})"
+            # 在框上方绘制标签
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(
+                original_image,
+                (x1, y1 - label_size[1] - 10),
+                (x1 + label_size[0], y1),
+                (0, 255, 0),
+                -1
+            )
+            cv2.putText(
+                original_image,
+                label,
+                (x1, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2
+            )
+    
     # 构建结果数据
     result_data = {
         "image_id": image_id,
         "plate_count": len(plates),
         "plates": plates
     }
+    
+    # 添加带框的图像（Base64）
+    if draw_box and original_image is not None:
+        result_data["image_with_boxes"] = _encode_image_base64(original_image)
     
     # 保存识别结果到本地文件 (JSON/XML)
     try:

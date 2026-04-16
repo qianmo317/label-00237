@@ -100,13 +100,15 @@ class ImageRecognitionRequest(BaseModel):
         default=UndistortPreset.NONE, 
         description="畸变矫正预设（针对广角摄像头）"
     )
+    draw_box: bool = Field(default=False, description="是否在原图上绘制检测框并以Base64返回")
     
     class Config:
         json_schema_extra = {
             "example": {
                 "image_data": "/9j/4AAQSkZJRg...",
                 "image_id": "img_001",
-                "undistort_preset": "none"
+                "undistort_preset": "none",
+                "draw_box": False
             }
         }
 
@@ -115,6 +117,7 @@ class UrlRecognitionRequest(BaseModel):
     """图像识别请求（URL）"""
     image_url: str = Field(..., description="图像URL")
     image_id: Optional[str] = Field(default=None, description="图像ID（可选）")
+    draw_box: bool = Field(default=False, description="是否在原图上绘制检测框并以Base64返回")
 
 
 class HealthResponse(BaseModel):
